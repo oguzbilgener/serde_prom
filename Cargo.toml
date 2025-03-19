@@ -1,0 +1,32 @@
+[package]
+name = "serde_prom"
+version = "0.1.0"
+edition = "2024"
+description = "A simple Prometheus serializer for serde"
+license = "MIT"
+authors = ["Oguz Bilgener <oguz@bilgener.me>"]
+documentation = "https://docs.rs/serde"
+repository = "http://github.com/oguzbilgener/serde_prom"
+keywords = ["serde", "prometheus", "metrics"]
+categories = ["encoding"]
+readme = "README.md"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+strum = "0.27"
+strum_macros = "0.27"
+thiserror = "2.0"
+
+[dev-dependencies]
+anyhow = "1"
+indoc = "2.0.6"
+pretty_assertions = "1.4.1"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = "warn"
+cargo = "warn"
+all = "warn"
