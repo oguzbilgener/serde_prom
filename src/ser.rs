@@ -5,6 +5,7 @@ use serde::ser::{
     SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant, SerializeTuple,
     SerializeTupleStruct, SerializeTupleVariant, Serializer,
 };
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use strum_macros::{AsRefStr, Display as DisplayStr, EnumString};
@@ -34,7 +35,10 @@ pub struct MetricDescriptor<'s> {
 }
 
 /// A custom serializer that flattens structs into Prometheus metrics.
-pub struct PrometheusSerializer<'s, W: io::Write> {
+pub struct PrometheusSerializer<'s, W>
+where
+    W: io::Write,
+{
     /// The output buffer where we accumulate Prometheus text.
     output: W,
     /// Current prefix (path) being processed. Nested fields append `_field_name`.
@@ -47,6 +51,8 @@ pub struct PrometheusSerializer<'s, W: io::Write> {
     default_desc: MetricDescriptor<'s>,
     /// Optional namespace to prefix all metric names.
     namespace: Option<&'s str>,
+    /// Common labels to apply to all metrics.
+    common_labels: Vec<(&'s str, &'s str)>,
 }
 
 impl<'s, W> PrometheusSerializer<'s, W>
@@ -54,11 +60,16 @@ where
     W: io::Write,
 {
     /// Create a new serializer.
-    pub fn new(
+    pub fn new<L, Li>(
         output: W,
         namespace: Option<&'s str>,
         metadata: &'s HashMap<&'s str, MetricDescriptor>,
-    ) -> Self {
+        common_labels: L,
+    ) -> Self
+    where
+        L: IntoIterator<Item = Li>,
+        Li: Borrow<(&'s str, &'s str)>,
+    {
         PrometheusSerializer {
             output,
             current_prefix: String::new(),
@@ -66,6 +77,13 @@ where
             seen_metrics: HashSet::new(),
             default_desc: MetricDescriptor::default(),
             namespace,
+            common_labels: common_labels
+                .into_iter()
+                .map(|el| {
+                    let (k, v) = el.borrow();
+                    (*k, *v)
+                })
+                .collect(),
         }
     }
 
@@ -76,7 +94,8 @@ where
         for c in val.chars() {
             match c {
                 '\\' => escaped.push_str("\\\\"),
-                '\"' => escaped.push_str("\\\""),
+                '"' => escaped.push_str("\\\""),
+                '\n' => escaped.push_str("\\n"),
                 _ => escaped.push(c),
             }
         }
@@ -121,8 +140,27 @@ where
 
         // metric_name{labels} value
         self.output.write_all(full_metric_name.as_bytes())?;
-        if !desc.labels.is_empty() {
+        if !self.common_labels.is_empty() || !desc.labels.is_empty() {
             self.output.write_all(b"{")?;
+        }
+        self.common_labels
+            .iter()
+            .enumerate()
+            .for_each(|(i, label)| {
+                if i > 0 {
+                    self.output.write_all(b",").unwrap();
+                }
+                self.output.write_all(label.borrow().0.as_bytes()).unwrap();
+                self.output.write_all(b"=\"").unwrap();
+                self.output
+                    .write_all(Self::escape_label_value(label.borrow().1).as_bytes())
+                    .unwrap();
+                self.output.write_all(b"\"").unwrap();
+            });
+        if !desc.labels.is_empty() {
+            if !self.common_labels.is_empty() {
+                self.output.write_all(b",").unwrap();
+            }
             for (i, (k, v)) in desc.labels.iter().enumerate() {
                 if i > 0 {
                     self.output.write_all(b",")?;
@@ -133,6 +171,8 @@ where
                     .write_all(Self::escape_label_value(v).as_bytes())?;
                 self.output.write_all(b"\"")?;
             }
+        }
+        if !self.common_labels.is_empty() || !desc.labels.is_empty() {
             self.output.write_all(b"}")?;
         }
 
@@ -149,13 +189,19 @@ where
 /// # Errors
 /// Returns a `PrometheusError` if serialization fails.
 ///
-pub fn to_prometheus_text<T: Serialize>(
+pub fn to_prometheus_text<'s, T, L, Li>(
     value: &T,
-    namespace: Option<&'_ str>,
-    metadata: &HashMap<&'_ str, MetricDescriptor>,
-) -> Result<String, PrometheusError> {
+    namespace: Option<&'s str>,
+    metadata: &'s HashMap<&'s str, MetricDescriptor>,
+    common_labels: L,
+) -> Result<String, PrometheusError>
+where
+    T: ?Sized + Serialize,
+    L: IntoIterator<Item = Li>,
+    Li: Borrow<(&'s str, &'s str)>,
+{
     let mut buf = Vec::new();
-    let mut serializer = PrometheusSerializer::new(&mut buf, namespace, metadata);
+    let mut serializer = PrometheusSerializer::new(&mut buf, namespace, metadata, common_labels);
     value.serialize(&mut serializer)?;
     String::from_utf8(buf).map_err(|e| PrometheusError::Custom(e.to_string()))
 }
@@ -166,13 +212,20 @@ pub fn to_prometheus_text<T: Serialize>(
 /// # Errors
 /// Returns a `PrometheusError` if serialization fails.
 ///
-pub fn write_prometheus_text<T: Serialize, W: io::Write>(
+pub fn write_prometheus_text<'s, T, W, L, Li>(
     value: &T,
     writer: &mut W,
-    namespace: Option<&'_ str>,
-    metadata: &HashMap<&'static str, MetricDescriptor>,
-) -> Result<(), PrometheusError> {
-    let mut serializer = PrometheusSerializer::new(writer, namespace, metadata);
+    namespace: Option<&'s str>,
+    metadata: &'s HashMap<&'static str, MetricDescriptor>,
+    common_labels: L,
+) -> Result<(), PrometheusError>
+where
+    T: ?Sized + Serialize,
+    W: io::Write,
+    L: IntoIterator<Item = Li>,
+    Li: Borrow<(&'s str, &'s str)>,
+{
+    let mut serializer = PrometheusSerializer::new(writer, namespace, metadata, common_labels);
     value.serialize(&mut serializer)?;
     Ok(())
 }
@@ -557,22 +610,23 @@ mod tests {
         let expected = indoc! {"
             # HELP my_requests Total number of requests processed
             # TYPE my_requests counter
-            my_requests 1024
+            my_requests{app=\"myapp\"} 1024
             # HELP my_errors Total number of errors
             # TYPE my_errors counter
-            my_errors{endpoint=\"login\"} 4
+            my_errors{app=\"myapp\",endpoint=\"login\"} 4
             # HELP my_inner_value Current value from inner struct
             # TYPE my_inner_value gauge
-            my_inner_value 3.42
+            my_inner_value{app=\"myapp\"} 3.42
             # HELP my_inner_threshold Threshold value from inner struct
             # TYPE my_inner_threshold gauge
-            my_inner_threshold 100
+            my_inner_threshold{app=\"myapp\"} 100
             # HELP my_inner_unknown ?
             # TYPE my_inner_unknown untyped
-            my_inner_unknown 55
+            my_inner_unknown{app=\"myapp\"} 55
         "};
 
-        let output = to_prometheus_text(&my_metrics, Some("my"), &meta).unwrap();
+        let labels = vec![("app", "myapp")];
+        let output = to_prometheus_text(&my_metrics, Some("my"), &meta, labels).unwrap();
         assert_eq!(output, expected);
     }
 }

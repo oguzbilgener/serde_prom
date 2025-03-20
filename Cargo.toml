@@ -1,6 +1,6 @@
 [package]
 name = "serde_prom"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A simple Prometheus serializer for serde"
 license = "MIT"
