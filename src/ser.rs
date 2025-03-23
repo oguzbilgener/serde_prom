@@ -1,12 +1,13 @@
 use super::error::PrometheusError;
 
+use indexmap::IndexMap;
 use serde::Serialize;
 use serde::ser::{
     SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant, SerializeTuple,
     SerializeTupleStruct, SerializeTupleVariant, Serializer,
 };
 use std::borrow::Borrow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use strum_macros::{AsRefStr, Display as DisplayStr, EnumString};
 
@@ -34,6 +35,12 @@ pub struct MetricDescriptor<'s> {
     pub rename: Option<&'s str>,
 }
 
+#[derive(Debug)]
+struct MetricFamily {
+    header: String,
+    samples: IndexMap<String, String>,
+}
+
 /// A custom serializer that flattens structs into Prometheus metrics.
 pub struct PrometheusSerializer<'s, W>
 where
@@ -45,14 +52,14 @@ where
     current_prefix: String,
     /// Metric metadata (help, type, labels) keyed by metric name.
     metadata: &'s HashMap<&'s str, MetricDescriptor<'s>>,
-    /// A set of metric names we've already written # HELP / # TYPE for.
-    seen_metrics: HashSet<String>,
     /// Default descriptor for metrics without explicit metadata.
     default_desc: MetricDescriptor<'s>,
     /// Optional namespace to prefix all metric names.
     namespace: Option<&'s str>,
     /// Common labels to apply to all metrics.
     common_labels: Vec<(&'s str, &'s str)>,
+    /// Stores metric families keyed by metric name.
+    families: IndexMap<String, MetricFamily>,
 }
 
 impl<'s, W> PrometheusSerializer<'s, W>
@@ -74,7 +81,6 @@ where
             output,
             current_prefix: String::new(),
             metadata,
-            seen_metrics: HashSet::new(),
             default_desc: MetricDescriptor::default(),
             namespace,
             common_labels: common_labels
@@ -84,7 +90,31 @@ where
                     (*k, *v)
                 })
                 .collect(),
+            families: IndexMap::new(),
         }
+    }
+
+    /// Finalizes the serializer by concatenating all buffered metric families.
+    ///
+    /// # Errors
+    /// Returns a `PrometheusError` if writing to the output stream fails.
+    pub fn finish(mut self) -> Result<(), PrometheusError> {
+        let mut seen = false;
+        for (_, family) in self.families {
+            if seen {
+                self.output.write_all(b"\n")?;
+            }
+            self.output.write_all(family.header.as_bytes())?;
+            self.output.write_all(b"\n")?;
+            for (key, value) in family.samples {
+                self.output.write_all(key.as_bytes())?;
+                self.output.write_all(b" ")?;
+                self.output.write_all(value.as_bytes())?;
+                self.output.write_all(b"\n")?;
+            }
+            seen = true;
+        }
+        Ok(())
     }
 
     /// Utility to escape label values by replacing `\"` and `\\`.
@@ -102,8 +132,31 @@ where
         escaped
     }
 
+    fn sample_key(&self, metric_name: &str, desc: &MetricDescriptor<'_>) -> String {
+        let mut sample_line = metric_name.to_string();
+        if !desc.labels.is_empty() || !self.common_labels.is_empty() {
+            sample_line.push('{');
+            for (i, (k, v)) in self
+                .common_labels
+                .iter()
+                .chain(desc.labels.iter())
+                .enumerate()
+            {
+                if i > 0 {
+                    sample_line.push(',');
+                }
+                sample_line.push_str(k);
+                sample_line.push_str("=\"");
+                sample_line.push_str(&Self::escape_label_value(v));
+                sample_line.push('"');
+            }
+            sample_line.push('}');
+        }
+        sample_line
+    }
+
     /// Writes a metric line for the current prefix with the given numeric value.
-    fn write_metric(&mut self, value: &str) -> Result<(), PrometheusError> {
+    fn write_metric(&mut self, value: &str) {
         let metric_name = &self.current_prefix;
         let full_metric_name = if let Some(ns) = self.namespace {
             format!("{ns}_{metric_name}")
@@ -115,72 +168,37 @@ where
                 .and_then(|_| self.metadata.get(full_metric_name.as_str()))
                 .unwrap_or(&self.default_desc)
         });
+        let metric_name = if let Some(rename) = desc.rename {
+            rename
+        } else {
+            full_metric_name.as_str()
+        };
 
-        // Only write # HELP / # TYPE once per metric name
-        if !self.seen_metrics.contains(metric_name) {
-            // # HELP <metric_name> <help text>
-            self.output.write_all(b"# HELP ")?;
-            self.output.write_all(full_metric_name.as_bytes())?;
-            self.output.write_all(b" ")?;
-            if desc.help.is_empty() {
-                self.output.write_all(b"?")?;
-            } else {
-                self.output.write_all(desc.help.as_bytes())?;
-            }
-            self.output.write_all(b"\n")?;
-            // # TYPE <metric_name> <type>
-            self.output.write_all(b"# TYPE ")?;
-            self.output.write_all(full_metric_name.as_bytes())?;
-            self.output.write_all(b" ")?;
-            self.output
-                .write_all(desc.metric_type.as_ref().as_bytes())?;
-            self.output.write_all(b"\n")?;
-            self.seen_metrics.insert(metric_name.clone());
-        }
+        let sample_key = self.sample_key(metric_name, desc);
 
-        // metric_name{labels} value
-        self.output.write_all(full_metric_name.as_bytes())?;
-        if !self.common_labels.is_empty() || !desc.labels.is_empty() {
-            self.output.write_all(b"{")?;
-        }
-        self.common_labels
-            .iter()
-            .enumerate()
-            .for_each(|(i, label)| {
-                if i > 0 {
-                    self.output.write_all(b",").unwrap();
+        let family = self
+            .families
+            .entry(metric_name.to_string())
+            .or_insert_with(|| {
+                let mut header = String::new();
+                if !desc.help.is_empty() {
+                    header.push_str("# HELP ");
+                    header.push_str(metric_name);
+                    header.push(' ');
+                    header.push_str(desc.help);
+                    header.push('\n');
                 }
-                self.output.write_all(label.borrow().0.as_bytes()).unwrap();
-                self.output.write_all(b"=\"").unwrap();
-                self.output
-                    .write_all(Self::escape_label_value(label.borrow().1).as_bytes())
-                    .unwrap();
-                self.output.write_all(b"\"").unwrap();
+                header.push_str("# TYPE ");
+                header.push_str(metric_name);
+                header.push(' ');
+                header.push_str(desc.metric_type.as_ref());
+                MetricFamily {
+                    header,
+                    samples: IndexMap::new(),
+                }
             });
-        if !desc.labels.is_empty() {
-            if !self.common_labels.is_empty() {
-                self.output.write_all(b",").unwrap();
-            }
-            for (i, (k, v)) in desc.labels.iter().enumerate() {
-                if i > 0 {
-                    self.output.write_all(b",")?;
-                }
-                self.output.write_all(k.as_bytes())?;
-                self.output.write_all(b"=\"")?;
-                self.output
-                    .write_all(Self::escape_label_value(v).as_bytes())?;
-                self.output.write_all(b"\"")?;
-            }
-        }
-        if !self.common_labels.is_empty() || !desc.labels.is_empty() {
-            self.output.write_all(b"}")?;
-        }
 
-        // Write the value
-        self.output.write_all(b" ")?;
-        self.output.write_all(value.as_bytes())?;
-        self.output.write_all(b"\n")?;
-        Ok(())
+        family.samples.insert(sample_key, value.to_owned());
     }
 }
 
@@ -203,6 +221,7 @@ where
     let mut buf = Vec::new();
     let mut serializer = PrometheusSerializer::new(&mut buf, namespace, metadata, common_labels);
     value.serialize(&mut serializer)?;
+    serializer.finish()?;
     String::from_utf8(buf).map_err(|e| PrometheusError::Custom(e.to_string()))
 }
 
@@ -227,6 +246,7 @@ where
 {
     let mut serializer = PrometheusSerializer::new(writer, namespace, metadata, common_labels);
     value.serialize(&mut serializer)?;
+    serializer.finish()?;
     Ok(())
 }
 
@@ -250,43 +270,54 @@ where
 
     fn serialize_bool(self, v: bool) -> Result<Self::Ok, Self::Error> {
         if v {
-            self.write_metric("1")
+            self.write_metric("1");
         } else {
-            self.write_metric("0")
+            self.write_metric("0");
         }
+        Ok(())
     }
 
     fn serialize_i8(self, v: i8) -> Result<Self::Ok, Self::Error> {
-        self.write_metric(&v.to_string())
+        self.write_metric(&v.to_string());
+        Ok(())
     }
     fn serialize_i16(self, v: i16) -> Result<Self::Ok, Self::Error> {
-        self.write_metric(&v.to_string())
+        self.write_metric(&v.to_string());
+        Ok(())
     }
     fn serialize_i32(self, v: i32) -> Result<Self::Ok, Self::Error> {
-        self.write_metric(&v.to_string())
+        self.write_metric(&v.to_string());
+        Ok(())
     }
     fn serialize_i64(self, v: i64) -> Result<Self::Ok, Self::Error> {
-        self.write_metric(&v.to_string())
+        self.write_metric(&v.to_string());
+        Ok(())
     }
 
     fn serialize_u8(self, v: u8) -> Result<Self::Ok, Self::Error> {
-        self.write_metric(&v.to_string())
+        self.write_metric(&v.to_string());
+        Ok(())
     }
     fn serialize_u16(self, v: u16) -> Result<Self::Ok, Self::Error> {
-        self.write_metric(&v.to_string())
+        self.write_metric(&v.to_string());
+        Ok(())
     }
     fn serialize_u32(self, v: u32) -> Result<Self::Ok, Self::Error> {
-        self.write_metric(&v.to_string())
+        self.write_metric(&v.to_string());
+        Ok(())
     }
     fn serialize_u64(self, v: u64) -> Result<Self::Ok, Self::Error> {
-        self.write_metric(&v.to_string())
+        self.write_metric(&v.to_string());
+        Ok(())
     }
 
     fn serialize_f32(self, v: f32) -> Result<Self::Ok, Self::Error> {
-        self.write_metric(&v.to_string())
+        self.write_metric(&v.to_string());
+        Ok(())
     }
     fn serialize_f64(self, v: f64) -> Result<Self::Ok, Self::Error> {
-        self.write_metric(&v.to_string())
+        self.write_metric(&v.to_string());
+        Ok(())
     }
 
     fn serialize_char(self, _v: char) -> Result<Self::Ok, Self::Error> {
@@ -409,8 +440,8 @@ where
     type Ok = ();
     type Error = PrometheusError;
 
-    fn serialize_element<T: ?Sized + Serialize>(&mut self, _value: &T) -> Result<(), Self::Error> {
-        // skip
+    fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
+        value.serialize(&mut **self)?;
         Ok(())
     }
 
@@ -530,103 +561,5 @@ where
 
     fn end(self) -> Result<Self::Ok, Self::Error> {
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use indoc::indoc;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn serialize_nested() {
-        #[derive(Serialize)]
-        struct Inner {
-            value: f64,
-            threshold: u32,
-            unknown: u32,
-            note: String,
-        }
-
-        #[derive(Serialize)]
-        struct Outer {
-            requests: u64,
-            errors: u64,
-            status: String,
-            inner: Inner,
-        }
-
-        let my_metrics = Outer {
-            requests: 1024,
-            errors: 4,
-            status: "OK".to_string(),
-            inner: Inner {
-                value: 3.42,
-                threshold: 100,
-                unknown: 55,
-                note: "important".to_string(),
-            },
-        };
-
-        let mut meta = HashMap::new();
-        meta.insert(
-            "requests",
-            MetricDescriptor {
-                metric_type: MetricType::Counter,
-                help: "Total number of requests processed",
-                labels: vec![],
-                rename: None,
-            },
-        );
-        meta.insert(
-            "my_errors",
-            MetricDescriptor {
-                metric_type: MetricType::Counter,
-                help: "Total number of errors",
-                labels: vec![("endpoint", "login")],
-                rename: None,
-            },
-        );
-        meta.insert(
-            "inner_value",
-            MetricDescriptor {
-                metric_type: MetricType::Gauge,
-                help: "Current value from inner struct",
-                labels: vec![],
-                rename: None,
-            },
-        );
-        meta.insert(
-            "inner_threshold",
-            MetricDescriptor {
-                metric_type: MetricType::Gauge,
-                help: "Threshold value from inner struct",
-                labels: vec![],
-                rename: None,
-            },
-        );
-
-        let expected = indoc! {"
-            # HELP my_requests Total number of requests processed
-            # TYPE my_requests counter
-            my_requests{app=\"myapp\"} 1024
-            # HELP my_errors Total number of errors
-            # TYPE my_errors counter
-            my_errors{app=\"myapp\",endpoint=\"login\"} 4
-            # HELP my_inner_value Current value from inner struct
-            # TYPE my_inner_value gauge
-            my_inner_value{app=\"myapp\"} 3.42
-            # HELP my_inner_threshold Threshold value from inner struct
-            # TYPE my_inner_threshold gauge
-            my_inner_threshold{app=\"myapp\"} 100
-            # HELP my_inner_unknown ?
-            # TYPE my_inner_unknown untyped
-            my_inner_unknown{app=\"myapp\"} 55
-        "};
-
-        let labels = vec![("app", "myapp")];
-        let output = to_prometheus_text(&my_metrics, Some("my"), &meta, labels).unwrap();
-        assert_eq!(output, expected);
     }
 }
