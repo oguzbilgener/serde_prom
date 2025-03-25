@@ -11,14 +11,20 @@ use std::collections::HashMap;
 use std::io;
 use strum_macros::{AsRefStr, Display as DisplayStr, EnumString};
 
+/// Metric type (counter, gauge, histogram, summary, etc.)
 #[derive(Debug, Clone, Copy, EnumString, AsRefStr, DisplayStr, Default, PartialEq, Eq)]
 #[strum(serialize_all = "snake_case")]
 pub enum MetricType {
+    /// Untyped metric (default)
     #[default]
     Untyped,
+    /// Counter metric
     Counter,
+    /// Gauge metric
     Gauge,
+    /// Histogram metric
     Histogram,
+    /// Summary metric
     Summary,
 }
 
@@ -55,7 +61,7 @@ where
     /// Default descriptor for metrics without explicit metadata.
     default_desc: MetricDescriptor<'s>,
     /// Optional namespace to prefix all metric names.
-    namespace: Option<&'s str>,
+    namespace: Option<String>,
     /// Common labels to apply to all metrics.
     common_labels: Vec<(&'s str, &'s str)>,
     /// Stores metric families keyed by metric name.
@@ -69,7 +75,7 @@ where
     /// Create a new serializer.
     pub fn new<L, Li>(
         output: W,
-        namespace: Option<&'s str>,
+        namespace: Option<impl Into<String>>,
         metadata: &'s HashMap<&'s str, MetricDescriptor>,
         common_labels: L,
     ) -> Self
@@ -82,7 +88,7 @@ where
             current_prefix: String::new(),
             metadata,
             default_desc: MetricDescriptor::default(),
-            namespace,
+            namespace: namespace.map(Into::into),
             common_labels: common_labels
                 .into_iter()
                 .map(|el| {
@@ -98,7 +104,7 @@ where
     ///
     /// # Errors
     /// Returns a `PrometheusError` if writing to the output stream fails.
-    pub fn finish(mut self) -> Result<(), PrometheusError> {
+    pub fn finish(mut self) -> Result<W, PrometheusError> {
         let mut seen = false;
         for (_, family) in self.families {
             if seen {
@@ -114,7 +120,7 @@ where
             }
             seen = true;
         }
-        Ok(())
+        Ok(self.output)
     }
 
     /// Utility to escape label values by replacing `\"` and `\\`.
@@ -158,13 +164,14 @@ where
     /// Writes a metric line for the current prefix with the given numeric value.
     fn write_metric(&mut self, value: &str) {
         let metric_name = &self.current_prefix;
-        let full_metric_name = if let Some(ns) = self.namespace {
+        let full_metric_name = if let Some(ns) = &self.namespace {
             format!("{ns}_{metric_name}")
         } else {
             metric_name.clone()
         };
         let desc = self.metadata.get(metric_name.as_str()).unwrap_or_else(|| {
             self.namespace
+                .as_ref()
                 .and_then(|_| self.metadata.get(full_metric_name.as_str()))
                 .unwrap_or(&self.default_desc)
         });

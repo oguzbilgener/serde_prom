@@ -2,7 +2,9 @@
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::implicit_hasher)]
 pub use error::PrometheusError;
-pub use ser::{PrometheusSerializer, to_prometheus_text, write_prometheus_text};
+pub use ser::{
+    MetricDescriptor, MetricType, PrometheusSerializer, to_prometheus_text, write_prometheus_text,
+};
 
 mod error;
 mod ser;
