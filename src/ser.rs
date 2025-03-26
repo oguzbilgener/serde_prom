@@ -8,7 +8,7 @@ use serde::ser::{
 };
 use std::borrow::Borrow;
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Cursor};
 use strum_macros::{AsRefStr, Display as DisplayStr, EnumString};
 
 /// Metric type (counter, gauge, histogram, summary, etc.)
@@ -48,12 +48,7 @@ struct MetricFamily {
 }
 
 /// A custom serializer that flattens structs into Prometheus metrics.
-pub struct PrometheusSerializer<'s, W>
-where
-    W: io::Write,
-{
-    /// The output buffer where we accumulate Prometheus text.
-    output: W,
+pub struct PrometheusSerializer<'s> {
     /// Current prefix (path) being processed. Nested fields append `_field_name`.
     current_prefix: String,
     /// Metric metadata (help, type, labels) keyed by metric name.
@@ -64,17 +59,15 @@ where
     namespace: Option<String>,
     /// Common labels to apply to all metrics.
     common_labels: Vec<(&'s str, &'s str)>,
+    /// Optional labels to apply when serializing a metric. Possible to set by calling
+    current_labels: Vec<(String, String)>,
     /// Stores metric families keyed by metric name.
     families: IndexMap<String, MetricFamily>,
 }
 
-impl<'s, W> PrometheusSerializer<'s, W>
-where
-    W: io::Write,
-{
+impl<'s> PrometheusSerializer<'s> {
     /// Create a new serializer.
     pub fn new<L, Li>(
-        output: W,
         namespace: Option<impl Into<String>>,
         metadata: &'s HashMap<&'s str, MetricDescriptor>,
         common_labels: L,
@@ -84,7 +77,6 @@ where
         Li: Borrow<(&'s str, &'s str)>,
     {
         PrometheusSerializer {
-            output,
             current_prefix: String::new(),
             metadata,
             default_desc: MetricDescriptor::default(),
@@ -96,31 +88,43 @@ where
                     (*k, *v)
                 })
                 .collect(),
+            current_labels: Vec::new(),
             families: IndexMap::new(),
         }
+    }
+
+    /// Set the current labels to apply when serializing a metric.
+    pub fn set_current_labels<L>(&mut self, labels: L)
+    where
+        L: IntoIterator<Item = (String, String)>,
+    {
+        self.current_labels = labels.into_iter().collect();
     }
 
     /// Finalizes the serializer by concatenating all buffered metric families.
     ///
     /// # Errors
     /// Returns a `PrometheusError` if writing to the output stream fails.
-    pub fn finish(mut self) -> Result<W, PrometheusError> {
+    pub fn finish<W>(self, mut output: W) -> Result<(), PrometheusError>
+    where
+        W: io::Write,
+    {
         let mut seen = false;
         for (_, family) in self.families {
             if seen {
-                self.output.write_all(b"\n")?;
+                output.write_all(b"\n")?;
             }
-            self.output.write_all(family.header.as_bytes())?;
-            self.output.write_all(b"\n")?;
+            output.write_all(family.header.as_bytes())?;
+            output.write_all(b"\n")?;
             for (key, value) in family.samples {
-                self.output.write_all(key.as_bytes())?;
-                self.output.write_all(b" ")?;
-                self.output.write_all(value.as_bytes())?;
-                self.output.write_all(b"\n")?;
+                output.write_all(key.as_bytes())?;
+                output.write_all(b" ")?;
+                output.write_all(value.as_bytes())?;
+                output.write_all(b"\n")?;
             }
             seen = true;
         }
-        Ok(self.output)
+        Ok(())
     }
 
     /// Utility to escape label values by replacing `\"` and `\\`.
@@ -140,12 +144,17 @@ where
 
     fn sample_key(&self, metric_name: &str, desc: &MetricDescriptor<'_>) -> String {
         let mut sample_line = metric_name.to_string();
-        if !desc.labels.is_empty() || !self.common_labels.is_empty() {
+        if !desc.labels.is_empty()
+            || !self.common_labels.is_empty()
+            || !self.current_labels.is_empty()
+        {
             sample_line.push('{');
             for (i, (k, v)) in self
-                .common_labels
+                .current_labels
                 .iter()
-                .chain(desc.labels.iter())
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .chain(self.common_labels.iter().copied())
+                .chain(desc.labels.iter().copied())
                 .enumerate()
             {
                 if i > 0 {
@@ -164,7 +173,7 @@ where
     /// Writes a metric line for the current prefix with the given numeric value.
     fn write_metric(&mut self, value: &str) {
         let metric_name = &self.current_prefix;
-        let full_metric_name = if let Some(ns) = &self.namespace {
+        let ns_metric_name = if let Some(ns) = &self.namespace {
             format!("{ns}_{metric_name}")
         } else {
             metric_name.clone()
@@ -172,13 +181,17 @@ where
         let desc = self.metadata.get(metric_name.as_str()).unwrap_or_else(|| {
             self.namespace
                 .as_ref()
-                .and_then(|_| self.metadata.get(full_metric_name.as_str()))
+                .and_then(|_| self.metadata.get(ns_metric_name.as_str()))
                 .unwrap_or(&self.default_desc)
         });
         let metric_name = if let Some(rename) = desc.rename {
-            rename
+            if let Some(ns) = &self.namespace {
+                &format!("{ns}_{rename}")
+            } else {
+                rename
+            }
         } else {
-            full_metric_name.as_str()
+            ns_metric_name.as_str()
         };
 
         let sample_key = self.sample_key(metric_name, desc);
@@ -225,11 +238,11 @@ where
     L: IntoIterator<Item = Li>,
     Li: Borrow<(&'s str, &'s str)>,
 {
-    let mut buf = Vec::new();
-    let mut serializer = PrometheusSerializer::new(&mut buf, namespace, metadata, common_labels);
+    let mut serializer = PrometheusSerializer::new(namespace, metadata, common_labels);
     value.serialize(&mut serializer)?;
-    serializer.finish()?;
-    String::from_utf8(buf).map_err(|e| PrometheusError::Custom(e.to_string()))
+    let mut buf = Cursor::new(Vec::new());
+    serializer.finish(&mut buf)?;
+    String::from_utf8(buf.into_inner()).map_err(|e| PrometheusError::Custom(e.to_string()))
 }
 
 /// Primary helper to write a `T: Serialize` into a n output stream as Prometheus text.
@@ -251,16 +264,13 @@ where
     L: IntoIterator<Item = Li>,
     Li: Borrow<(&'s str, &'s str)>,
 {
-    let mut serializer = PrometheusSerializer::new(writer, namespace, metadata, common_labels);
+    let mut serializer = PrometheusSerializer::new(namespace, metadata, common_labels);
     value.serialize(&mut serializer)?;
-    serializer.finish()?;
+    serializer.finish(writer)?;
     Ok(())
 }
 
-impl<W> Serializer for &mut PrometheusSerializer<'_, W>
-where
-    W: io::Write,
-{
+impl Serializer for &mut PrometheusSerializer<'_> {
     type Ok = ();
     type Error = PrometheusError;
 
@@ -440,10 +450,7 @@ where
     }
 }
 
-impl<W> SerializeSeq for &mut PrometheusSerializer<'_, W>
-where
-    W: io::Write,
-{
+impl SerializeSeq for &mut PrometheusSerializer<'_> {
     type Ok = ();
     type Error = PrometheusError;
 
@@ -457,10 +464,7 @@ where
     }
 }
 
-impl<W> SerializeTuple for &mut PrometheusSerializer<'_, W>
-where
-    W: io::Write,
-{
+impl SerializeTuple for &mut PrometheusSerializer<'_> {
     type Ok = ();
     type Error = PrometheusError;
 
@@ -473,10 +477,7 @@ where
     }
 }
 
-impl<W> SerializeTupleStruct for &mut PrometheusSerializer<'_, W>
-where
-    W: io::Write,
-{
+impl SerializeTupleStruct for &mut PrometheusSerializer<'_> {
     type Ok = ();
     type Error = PrometheusError;
 
@@ -489,10 +490,7 @@ where
     }
 }
 
-impl<W> SerializeTupleVariant for &mut PrometheusSerializer<'_, W>
-where
-    W: io::Write,
-{
+impl SerializeTupleVariant for &mut PrometheusSerializer<'_> {
     type Ok = ();
     type Error = PrometheusError;
 
@@ -505,10 +503,7 @@ where
     }
 }
 
-impl<W> SerializeMap for &mut PrometheusSerializer<'_, W>
-where
-    W: io::Write,
-{
+impl SerializeMap for &mut PrometheusSerializer<'_> {
     type Ok = ();
     type Error = PrometheusError;
 
@@ -524,10 +519,7 @@ where
     }
 }
 
-impl<W> SerializeStruct for &mut PrometheusSerializer<'_, W>
-where
-    W: io::Write,
-{
+impl SerializeStruct for &mut PrometheusSerializer<'_> {
     type Ok = ();
     type Error = PrometheusError;
 
@@ -551,10 +543,7 @@ where
     }
 }
 
-impl<W> SerializeStructVariant for &mut PrometheusSerializer<'_, W>
-where
-    W: io::Write,
-{
+impl SerializeStructVariant for &mut PrometheusSerializer<'_> {
     type Ok = ();
     type Error = PrometheusError;
 
